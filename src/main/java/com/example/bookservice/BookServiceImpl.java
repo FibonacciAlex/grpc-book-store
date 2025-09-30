@@ -2,14 +2,22 @@ package com.example.bookservice;
 
 import com.example.BookServiceGrpc;
 import com.example.BookServiceProto;
+import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
-import java.util.*;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 public class BookServiceImpl extends BookServiceGrpc.BookServiceImplBase {
 
-    private final Map<String, BookServiceProto.Book> books = new ConcurrentHashMap<>();
+    private static final long LOCK_WAIT_TIMEOUT_MS = 100;
+    private static final int LOCK_MAX_ATTEMPTS = 50;
+    
+
+    private final ConcurrentHashMap<String, BookEntry> books = new ConcurrentHashMap<>();
     private final AtomicInteger bookIdCounter = new AtomicInteger(0);
 
     @Override
@@ -26,7 +34,7 @@ public class BookServiceImpl extends BookServiceGrpc.BookServiceImplBase {
                     .setPublicationYear(request.getPublicationYear())
                     .build();
 
-            books.put(bookId, book);
+            books.put(bookId, new BookEntry(book));
 
             BookServiceProto.BookResponse response = BookServiceProto.BookResponse.newBuilder()
                     .setMessage("Book added successfully")
@@ -47,9 +55,35 @@ public class BookServiceImpl extends BookServiceGrpc.BookServiceImplBase {
                            StreamObserver<BookServiceProto.DeleteBookResponse> responseObserver) {
         try {
             String bookId = request.getId();
+            BookEntry entry = books.get(bookId);
 
-            if (books.containsKey(bookId)) {
-                books.remove(bookId);
+            if (entry == null) {
+                BookServiceProto.DeleteBookResponse response = BookServiceProto.DeleteBookResponse.newBuilder()
+                        .setMessage("Book not found")
+                        .setSuccess(false)
+                        .build();
+
+                responseObserver.onNext(response);
+                responseObserver.onCompleted();
+                return;
+            }
+
+            Lock writeLock = entry.writeLock();
+            boolean acquired = false;
+            try {
+                acquired = acquireWithRetry(writeLock);
+                if (!acquired) {
+                    BookServiceProto.DeleteBookResponse response = BookServiceProto.DeleteBookResponse.newBuilder()
+                            .setMessage("Book is currently being modified, please retry later")
+                            .setSuccess(false)
+                            .build();
+                    responseObserver.onNext(response);
+                    responseObserver.onCompleted();
+                    return;
+                }
+
+                entry.clear();
+                books.remove(bookId, entry);
 
                 BookServiceProto.DeleteBookResponse response = BookServiceProto.DeleteBookResponse.newBuilder()
                         .setMessage("Book deleted successfully")
@@ -57,17 +91,18 @@ public class BookServiceImpl extends BookServiceGrpc.BookServiceImplBase {
                         .build();
 
                 responseObserver.onNext(response);
-            } else {
-                BookServiceProto.DeleteBookResponse response = BookServiceProto.DeleteBookResponse.newBuilder()
-                        .setMessage("Book not found")
-                        .setSuccess(false)
-                        .build();
-
-                responseObserver.onNext(response);
+                responseObserver.onCompleted();
+            } finally {
+                if (acquired) {
+                    writeLock.unlock();
+                }
             }
-
-            responseObserver.onCompleted();
-
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            responseObserver.onError(Status.CANCELLED
+                    .withDescription("Interrupted while waiting to delete book")
+                    .withCause(e)
+                    .asRuntimeException());
         } catch (Exception e) {
             responseObserver.onError(e);
         }
@@ -78,27 +113,61 @@ public class BookServiceImpl extends BookServiceGrpc.BookServiceImplBase {
                         StreamObserver<BookServiceProto.BookResponse> responseObserver) {
         try {
             String bookId = request.getId();
-            BookServiceProto.Book book = books.get(bookId);
+            BookEntry entry = books.get(bookId);
 
-            if (book != null) {
-                BookServiceProto.BookResponse response = BookServiceProto.BookResponse.newBuilder()
-                        .setMessage("Book found")
-                        .setSuccess(true)
-                        .setBook(book)
-                        .build();
-
-                responseObserver.onNext(response);
-            } else {
+            if (entry == null) {
                 BookServiceProto.BookResponse response = BookServiceProto.BookResponse.newBuilder()
                         .setMessage("Book not found")
                         .setSuccess(false)
                         .build();
 
                 responseObserver.onNext(response);
+                responseObserver.onCompleted();
+                return;
             }
 
-            responseObserver.onCompleted();
+            Lock readLock = entry.readLock();
+            boolean acquired = false;
+            try {
+                acquired = acquireWithRetry(readLock);
+                if (!acquired) {
+                    BookServiceProto.BookResponse response = BookServiceProto.BookResponse.newBuilder()
+                            .setMessage("Book is currently being modified, please retry later")
+                            .setSuccess(false)
+                            .build();
+                    responseObserver.onNext(response);
+                    responseObserver.onCompleted();
+                    return;
+                }
 
+                BookServiceProto.Book book = entry.snapshot();
+                if (book != null) {
+                    BookServiceProto.BookResponse response = BookServiceProto.BookResponse.newBuilder()
+                            .setMessage("Book found")
+                            .setSuccess(true)
+                            .setBook(book)
+                            .build();
+
+                    responseObserver.onNext(response);
+                } else {
+                    BookServiceProto.BookResponse response = BookServiceProto.BookResponse.newBuilder()
+                            .setMessage("Book not found")
+                            .setSuccess(false)
+                            .build();
+                    responseObserver.onNext(response);
+                }
+                responseObserver.onCompleted();
+            } finally {
+                if (acquired) {
+                    readLock.unlock();
+                }
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            responseObserver.onError(Status.CANCELLED
+                    .withDescription("Interrupted while waiting to read book")
+                    .withCause(e)
+                    .asRuntimeException());
         } catch (Exception e) {
             responseObserver.onError(e);
         }
@@ -111,25 +180,73 @@ public class BookServiceImpl extends BookServiceGrpc.BookServiceImplBase {
             BookServiceProto.ListBooksResponse.Builder responseBuilder =
                     BookServiceProto.ListBooksResponse.newBuilder();
 
-            for (BookServiceProto.Book book : books.values()) {
-                responseBuilder.addBooks(book);
+            for (Map.Entry<String, BookEntry> entry : books.entrySet()) {
+                BookEntry bookEntry = entry.getValue();
+                Lock readLock = bookEntry.readLock();
+                boolean acquired = false;
+                try {
+                    acquired = readLock.tryLock(LOCK_WAIT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+                    if (!acquired) {
+                        continue;
+                    }
+
+                    BookServiceProto.Book book = bookEntry.snapshot();
+                    if (book != null) {
+                        responseBuilder.addBooks(book);
+                    }
+                } finally {
+                    if (acquired) {
+                        readLock.unlock();
+                    }
+                }
             }
 
             responseObserver.onNext(responseBuilder.build());
             responseObserver.onCompleted();
-
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            responseObserver.onError(Status.CANCELLED
+                    .withDescription("Interrupted while listing books")
+                    .withCause(e)
+                    .asRuntimeException());
         } catch (Exception e) {
             responseObserver.onError(e);
         }
     }
+
 
     @Override
     public void updateBook(BookServiceProto.UpdateBookRequest request,
                            StreamObserver<BookServiceProto.BookResponse> responseObserver) {
         try {
             String bookId = request.getId();
+            BookEntry entry = books.get(bookId);
 
-            if (books.containsKey(bookId)) {
+            if (entry == null) {
+                BookServiceProto.BookResponse response = BookServiceProto.BookResponse.newBuilder()
+                        .setMessage("Book not found")
+                        .setSuccess(false)
+                        .build();
+
+                responseObserver.onNext(response);
+                responseObserver.onCompleted();
+                return;
+            }
+
+            Lock writeLock = entry.writeLock();
+            boolean acquired = false;
+            try {
+                acquired = acquireWithRetry(writeLock);
+                if (!acquired) {
+                    BookServiceProto.BookResponse response = BookServiceProto.BookResponse.newBuilder()
+                            .setMessage("Book is currently being modified, please retry later")
+                            .setSuccess(false)
+                            .build();
+                    responseObserver.onNext(response);
+                    responseObserver.onCompleted();
+                    return;
+                }
+
                 BookServiceProto.Book updatedBook = BookServiceProto.Book.newBuilder()
                         .setId(bookId)
                         .setTitle(request.getTitle())
@@ -138,7 +255,7 @@ public class BookServiceImpl extends BookServiceGrpc.BookServiceImplBase {
                         .setPublicationYear(request.getPublicationYear())
                         .build();
 
-                books.put(bookId, updatedBook);
+                entry.replace(updatedBook);
 
                 BookServiceProto.BookResponse response = BookServiceProto.BookResponse.newBuilder()
                         .setMessage("Book updated successfully")
@@ -147,19 +264,63 @@ public class BookServiceImpl extends BookServiceGrpc.BookServiceImplBase {
                         .build();
 
                 responseObserver.onNext(response);
-            } else {
-                BookServiceProto.BookResponse response = BookServiceProto.BookResponse.newBuilder()
-                        .setMessage("Book not found")
-                        .setSuccess(false)
-                        .build();
-
-                responseObserver.onNext(response);
+                responseObserver.onCompleted();
+            } finally {
+                if (acquired) {
+                    writeLock.unlock();
+                }
             }
-
-            responseObserver.onCompleted();
-
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            responseObserver.onError(Status.CANCELLED
+                    .withDescription("Interrupted while waiting to update book")
+                    .withCause(e)
+                    .asRuntimeException());
         } catch (Exception e) {
             responseObserver.onError(e);
+        }
+    }
+
+
+    private boolean acquireWithRetry(Lock lock) throws InterruptedException {
+        for (int attempt = 0; attempt < LOCK_MAX_ATTEMPTS; attempt++) {
+            if (lock.tryLock(LOCK_WAIT_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+
+    /**
+     * Combine book and lock
+     */
+    private static final class BookEntry {
+        private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
+        private BookServiceProto.Book book;
+
+        BookEntry(BookServiceProto.Book book) {
+            this.book = book;
+        }
+
+        Lock readLock() {
+            return lock.readLock();
+        }
+
+        Lock writeLock() {
+            return lock.writeLock();
+        }
+
+        BookServiceProto.Book snapshot() {
+            return book;
+        }
+
+        void replace(BookServiceProto.Book updated) {
+            this.book = updated;
+        }
+
+        void clear() {
+            this.book = null;
         }
     }
 }

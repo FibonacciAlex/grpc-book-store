@@ -4,12 +4,20 @@ import com.example.BookServiceGrpc;
 import com.example.BookServiceProto;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
+import io.grpc.Status;
+import io.grpc.StatusRuntimeException;
 import java.util.Scanner;
+import java.util.concurrent.Callable;
 import java.util.concurrent.TimeUnit;
 
 public class BookServiceClient {
     private final ManagedChannel channel;
     private final BookServiceGrpc.BookServiceBlockingStub blockingStub;
+
+    private static final int MAX_RETRIES = 3;
+    private static final long INITIAL_BACKOFF_MILLIS = 200;
+    private static final long MAX_BACKOFF_MILLIS = 2000;
+    private static final double BACKOFF_MULTIPLIER = 2.0;
 
     public BookServiceClient(String host, int port) {
         this.channel = ManagedChannelBuilder.forAddress(host, port)
@@ -31,7 +39,7 @@ public class BookServiceClient {
                     .setPublicationYear(publicationYear)
                     .build();
 
-            BookServiceProto.BookResponse response = blockingStub.addBook(request);
+            BookServiceProto.BookResponse response = executeWithRetry(() -> blockingStub.addBook(request), "add book");
 
             if (response.getSuccess()) {
                 System.out.println(" " + response.getMessage());
@@ -51,7 +59,7 @@ public class BookServiceClient {
                     .setId(bookId)
                     .build();
 
-            BookServiceProto.DeleteBookResponse response = blockingStub.deleteBook(request);
+            BookServiceProto.DeleteBookResponse response = executeWithRetry(() -> blockingStub.deleteBook(request), "delete book");
 
             if (response.getSuccess()) {
                 System.out.println(" " + response.getMessage());
@@ -70,7 +78,7 @@ public class BookServiceClient {
                     .setId(bookId)
                     .build();
 
-            BookServiceProto.BookResponse response = blockingStub.getBook(request);
+            BookServiceProto.BookResponse response = executeWithRetry(() -> blockingStub.getBook(request), "get book");
 
             if (response.getSuccess()) {
                 System.out.println(" " + response.getMessage());
@@ -93,7 +101,7 @@ public class BookServiceClient {
     public void listBooks() {
         try {
             BookServiceProto.ListBooksRequest request = BookServiceProto.ListBooksRequest.newBuilder().build();
-            BookServiceProto.ListBooksResponse response = blockingStub.listBooks(request);
+            BookServiceProto.ListBooksResponse response = executeWithRetry(() -> blockingStub.listBooks(request), "list books");
 
             System.out.println(" Book List:");
             if (response.getBooksList().isEmpty()) {
@@ -119,7 +127,7 @@ public class BookServiceClient {
                     .setPublicationYear(publicationYear)
                     .build();
 
-            BookServiceProto.BookResponse response = blockingStub.updateBook(request);
+            BookServiceProto.BookResponse response = executeWithRetry(() -> blockingStub.updateBook(request), "update book");
 
             if (response.getSuccess()) {
                 System.out.println(" " + response.getMessage());
@@ -130,6 +138,55 @@ public class BookServiceClient {
         } catch (Exception e) {
             System.err.println("Error updating book: " + e.getMessage());
         }
+    }
+
+    /**
+     * Set up retry strategy
+     * @param <T>
+     * @param action
+     * @param operation
+     * @return
+     * @throws Exception
+     */
+    private <T> T executeWithRetry(Callable<T> action, String operation) throws Exception {
+        long backoff = INITIAL_BACKOFF_MILLIS;
+        StatusRuntimeException lastStatus = null;
+
+        for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+            try {
+                return action.call();
+            } catch (StatusRuntimeException e) {
+                lastStatus = e;
+                if (!isRetryable(e) || attempt == MAX_RETRIES) {
+                    throw e;
+                }
+
+                try {
+                    Thread.sleep(backoff);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException("Retry interrupted for " + operation, ie);
+                }
+
+                backoff = (long) Math.min(backoff * BACKOFF_MULTIPLIER, MAX_BACKOFF_MILLIS);
+            } catch (Exception e) {
+                throw e;
+            }
+        }
+
+        if (lastStatus != null) {
+            throw lastStatus;
+        }
+        throw new RuntimeException("Failed to " + operation);
+    }
+
+    private boolean isRetryable(StatusRuntimeException e) {
+        Status.Code code = e.getStatus().getCode();
+        return code == Status.Code.UNAVAILABLE
+                || code == Status.Code.DEADLINE_EXCEEDED
+                || code == Status.Code.RESOURCE_EXHAUSTED
+                || code == Status.Code.ABORTED
+                || code == Status.Code.CANCELLED;
     }
 
     public static void main(String[] args) throws InterruptedException {

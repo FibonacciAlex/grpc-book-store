@@ -1,0 +1,62 @@
+syntax = "proto3";
+
+option java_package = "com.example";
+option java_outer_classname = "BookServiceProto";
+
+service BookService {
+  rpc AddBook(AddBookRequest) returns (BookResponse);
+  rpc DeleteBook(DeleteBookRequest) returns (DeleteBookResponse);
+  rpc GetBook(GetBookRequest) returns (BookResponse);
+  rpc ListBooks(ListBooksRequest) returns (ListBooksResponse);
+  rpc UpdateBook(UpdateBookRequest) returns (BookResponse);
+}
+
+message Book {
+  string id = 1;
+  string title = 2;
+  string author = 3;
+  string isbn = 4;
+  int32 publication_year = 5;
+}
+
+message AddBookRequest {
+  string title = 1;
+  string author = 2;
+  string isbn = 3;
+  int32 publication_year = 4;
+}
+
+message BookResponse {
+  string message = 1;
+  bool success = 2;
+  Book book = 3;
+}
+
+message DeleteBookRequest {
+  string id = 1;
+}
+
+message DeleteBookResponse {
+  string message = 1;
+  bool success = 2;
+}
+
+message GetBookRequest {
+  string id = 1;
+}
+
+message ListBooksRequest {
+  // Can add filters here if needed
+}
+
+message ListBooksResponse {
+  repeated Book books = 1;
+}
+
+message UpdateBookRequest {
+  string id = 1;
+  string title = 2;
+  string author = 3;
+  string isbn = 4;
+  int32 publication_year = 5;
+}
